@@ -508,17 +508,74 @@ namespace AddressLibraryManager
         /// </exception>
         public void WriteAddressLibrary(Database database, System.IO.FileInfo file)
         {
+            this.WriteAddressLibrary(database, file, AddressLibraryFormatFor(this.Version));
+        }
+
+        /// <summary>
+        /// Address Library file formats. 1 = Skyrim SE 1.5.x "version-*.bin", 2 = Anniversary Edition "versionlib-*.bin" up to
+        /// 1.6.1179 (same packing as 1), 5 = the dense table meh321 introduced with the 1.7.99 library (2026-08-20).
+        /// </summary>
+        public const int FormatPackedSE = 1;
+        public const int FormatPacked = 2;
+        public const int FormatDense = 5;
+        private const int DenseNameLength = 64;
+
+        /// <summary>
+        /// The format meh321 ships for a game version: 1 for 1.5.x, 2 for 1.6.x, 5 from 1.7 on.
+        /// </summary>
+        /// <param name="version">The game version.</param>
+        public static int AddressLibraryFormatFor(Version version)
+        {
+            var n = version.Numbers;
+            uint major = n.Count > 0 ? n[0] : 1;
+            uint minor = n.Count > 1 ? n[1] : 0;
+            if (major > 1 || (major == 1 && minor >= 7))
+                return FormatDense;
+            if (major == 1 && minor <= 5)
+                return FormatPackedSE;
+            return FormatPacked;
+        }
+
+        /// <summary>
+        /// Gets the file name the loaders look for: version-*.bin for format 1, versionlib-*.bin otherwise.
+        /// </summary>
+        public string AddressLibraryFileName
+        {
+            get
+            {
+                string root = AddressLibraryFormatFor(this.Version) == FormatPackedSE ? "version-" : "versionlib-";
+                return root + string.Join("-", this.Version.Numbers) + ".bin";
+            }
+        }
+
+        /// <summary>
+        /// Writes the address library in the given format.
+        /// </summary>
+        /// <param name="database">The database.</param>
+        /// <param name="file">The file.</param>
+        /// <param name="format">1, 2 or 5; see <see cref="AddressLibraryFormatFor"/>.</param>
+        public void WriteAddressLibrary(Database database, System.IO.FileInfo file, int format)
+        {
             if (database == null)
                 throw new ArgumentNullException("database");
 
             if (file == null)
                 throw new ArgumentNullException("file");
 
+            if (format == FormatDense)
+            {
+                this.WriteDenseAddressLibrary(database, file);
+                return;
+            }
+
+            if (format != FormatPacked && format != FormatPackedSE)
+                throw new ArgumentOutOfRangeException("format", "Supported Address Library formats are 1, 2 and 5.");
+
             using (var stream = file.Create())
             {
                 using (var f = new System.IO.BinaryWriter(stream))
                 {
-                    f.Write((int)2); // File format version.
+                    f.Write((int)format); // File format version.
 
                     {
                         var ver = this.Version.Numbers.ToList();
@@ -666,6 +723,200 @@ namespace AddressLibraryManager
                 case 7: w.Write((uint)offset); wsz += 4; break;
                 default:
                     throw new InvalidOperationException();
+            }
+        }
+
+        /// <summary>
+        /// Writes the format 5 library: a 96-byte header followed by one uint32 offset per ID, indexed directly by ID
+        /// (offset 0 = unassigned). This is the layout commonlib-shared's REL::IDDB::load_v5 memory-maps.
+        /// </summary>
+        /// <param name="database">The database.</param>
+        /// <param name="file">The file.</param>
+        private void WriteDenseAddressLibrary(Database database, System.IO.FileInfo file)
+        {
+            string name = this.OverwriteTargetModuleName;
+            if (name == null)
+                name = database.TargetModuleName;
+
+            if (name == null)
+                throw new NullReferenceException("TargetModuleName");
+
+            byte[] enc = Encoding.UTF8.GetBytes(name);
+            if (enc.Length >= DenseNameLength)
+                throw new InvalidOperationException("Target module name does not fit the 64-byte format 5 header: " + name);
+
+            long count = 0;
+            if (this.Values != null && this.Values.Count != 0)
+            {
+                foreach (var pair in this.Values)
+                {
+                    if (pair.Value == 0)
+                        throw new InvalidOperationException("ID " + pair.Key + " has offset 0, which format 5 reserves for unassigned IDs.");
+                    if (pair.Key >= int.MaxValue)
+                        throw new InvalidOperationException("ID " + pair.Key + " is too large for a format 5 table.");
+                }
+
+                count = (long)this.Values.Keys.Max() + 1;
+            }
+
+            using (var stream = file.Create())
+            {
+                using (var f = new System.IO.BinaryWriter(stream))
+                {
+                    f.Write((int)FormatDense); // File format version.
+
+                    {
+                        var ver = this.Version.Numbers.ToList();
+                        while (ver.Count < 4)
+                            ver.Add(0);
+                        while (ver.Count > 4)
+                            ver.RemoveAt(ver.Count - 1);
+
+                        foreach (var n in ver)
+                            f.Write(n);
+                    }
+
+                    var nameField = new byte[DenseNameLength];
+                    Array.Copy(enc, nameField, enc.Length);
+                    f.Write(nameField);
+
+                    f.Write(database.PointerSize);
+                    f.Write((int)0); // Data format; reserved, 0 in every library meh321 has published.
+                    f.Write((int)count);
+
+                    var table = new uint[count];
+                    if (this.Values != null)
+                    {
+                        foreach (var pair in this.Values)
+                            table[pair.Key] = pair.Value;
+                    }
+
+                    var bytes = new byte[count * 4];
+                    Buffer.BlockCopy(table, 0, bytes, 0, bytes.Length);
+                    f.Write(bytes);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Reads a version-*.bin / versionlib-*.bin of format 1, 2 or 5 into a new library (version and values only).
+        /// The module name and pointer size from the header come back through the out parameters so the caller can
+        /// check them against the database before importing.
+        /// </summary>
+        /// <param name="file">The file.</param>
+        /// <param name="format">The file format that was read.</param>
+        /// <param name="moduleName">Target module name from the header.</param>
+        /// <param name="pointerSize">Pointer size from the header.</param>
+        public static Library ReadAddressLibrary(System.IO.FileInfo file, out int format, out string moduleName, out int pointerSize)
+        {
+            if (file == null)
+                throw new ArgumentNullException("file");
+
+            using (var stream = file.OpenRead())
+            {
+                using (var f = new System.IO.BinaryReader(stream))
+                {
+                    format = f.ReadInt32();
+
+                    var lib = new Library();
+                    var nums = new uint[4];
+                    for (int i = 0; i < 4; i++)
+                        nums[i] = f.ReadUInt32();
+                    lib.Version = new Version(nums);
+                    lib.Values = new SortedDictionary<ulong, uint>();
+
+                    if (format == FormatDense)
+                    {
+                        var nameField = f.ReadBytes(DenseNameLength);
+                        if (nameField.Length != DenseNameLength)
+                            throw new FormatException("Truncated format 5 header!");
+                        int len = Array.IndexOf(nameField, (byte)0);
+                        if (len < 0)
+                            len = DenseNameLength;
+                        moduleName = Encoding.UTF8.GetString(nameField, 0, len);
+                        pointerSize = f.ReadInt32();
+                        f.ReadInt32(); // Data format; reserved.
+                        int count = f.ReadInt32();
+                        if (count < 0)
+                            throw new FormatException("Bad format 5 offset count!");
+
+                        var bytes = f.ReadBytes(count * 4);
+                        if (bytes.Length != count * 4)
+                            throw new FormatException("Truncated format 5 table!");
+
+                        for (int id = 0; id < count; id++)
+                        {
+                            uint offset = BitConverter.ToUInt32(bytes, id * 4);
+                            if (offset != 0)
+                                lib.Values.Add((ulong)id, offset);
+                        }
+                    }
+                    else if (format == FormatPacked || format == FormatPackedSE)
+                    {
+                        int nlen = f.ReadInt32();
+                        moduleName = Encoding.UTF8.GetString(f.ReadBytes(nlen));
+                        pointerSize = f.ReadInt32();
+                        int count = f.ReadInt32();
+
+                        ulong sz = (ulong)pointerSize;
+                        ulong pvid = 0;
+                        ulong poffset = 0;
+                        for (int i = 0; i < count; i++)
+                        {
+                            byte mask = f.ReadByte();
+                            byte low = (byte)(mask & 0xF);
+                            byte high = (byte)(mask >> 4);
+
+                            ulong vid;
+                            switch (low)
+                            {
+                                case 0: vid = f.ReadUInt64(); break;
+                                case 1: vid = pvid + 1; break;
+                                case 2: vid = pvid + f.ReadByte(); break;
+                                case 3: vid = pvid - f.ReadByte(); break;
+                                case 4: vid = pvid + f.ReadUInt16(); break;
+                                case 5: vid = pvid - f.ReadUInt16(); break;
+                                case 6: vid = f.ReadUInt16(); break;
+                                case 7: vid = f.ReadUInt32(); break;
+                                default:
+                                    throw new FormatException("Bad ID encoding at pair " + i + "!");
+                            }
+
+                            ulong pref = (high & 8) != 0 ? poffset / sz : poffset;
+                            ulong offset;
+                            switch (high & 7)
+                            {
+                                case 0: offset = f.ReadUInt64(); break;
+                                case 1: offset = pref + 1; break;
+                                case 2: offset = pref + f.ReadByte(); break;
+                                case 3: offset = pref - f.ReadByte(); break;
+                                case 4: offset = pref + f.ReadUInt16(); break;
+                                case 5: offset = pref - f.ReadUInt16(); break;
+                                case 6: offset = f.ReadUInt16(); break;
+                                case 7: offset = f.ReadUInt32(); break;
+                                default:
+                                    throw new FormatException("Bad offset encoding at pair " + i + "!");
+                            }
+
+                            if ((high & 8) != 0)
+                                offset *= sz;
+
+                            if (offset > uint.MaxValue)
+                                throw new FormatException("Offset of ID " + vid + " does not fit in 32 bits!");
+
+                            lib.Values[vid] = (uint)offset;
+                            pvid = vid;
+                            poffset = offset;
+                        }
+                    }
+                    else
+                        throw new FormatException("Unsupported Address Library format " + format + "! Supported formats are 1, 2 and 5.");
+
+                    if (stream.Position != stream.Length)
+                        throw new FormatException("Trailing data after the Address Library!");
+
+                    return lib;
+                }
             }
         }
     }

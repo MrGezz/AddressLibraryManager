@@ -1,2 +1,39 @@
-# Auto detect text files and perform LF normalization
+# Line endings: LF in the repository, native on checkout (overrides core.autocrlf).
 * text=auto
+
+# Files that need a specific ending on checkout
+*.sh      text eol=lf
+*.bat     text eol=crlf
+*.cmd     text eol=crlf
+*.sln     text eol=crlf
+
+# Patches are byte-exact
+*.diff    -text
+*.patch   -text
+
+# Binaries: never normalised, never diffed
+*.dll     binary
+*.exe     binary
+*.pdb     binary
+*.lib     binary
+*.obj     binary
+*.bin     binary
+*.pex     binary
+*.bsa     binary
+*.esp     binary
+*.esm     binary
+*.esl     binary
+*.nif     binary
+*.hkx     binary
+*.tri     binary
+*.dds     binary
+*.png     binary
+*.jpg     binary
+*.ico     binary
+*.wav     binary
+*.xwm     binary
+*.fuz     binary
+*.swf     binary
+*.zip     binary
+*.7z      binary
+*.rar     binary

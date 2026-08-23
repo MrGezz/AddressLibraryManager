@@ -17,6 +17,97 @@ namespace AddressLibraryManager
         public Form1()
         {
             InitializeComponent();
+
+            this.toolsToolStripMenuItem.DropDownItems.Add(new ToolStripSeparator());
+            this.toolsToolStripMenuItem.DropDownItems.Add("Import an Address Library .bin (format 1, 2 or 5) into a version", null, this.importAddressLibraryToolStripMenuItem_Click);
+        }
+
+        /// <summary>
+        /// Imports the offsets of a published version-*.bin / versionlib-*.bin into the version it declares, creating the
+        /// version when the database does not have it yet. This is how a column for a game version whose library meh321
+        /// published first (1.7.99, format 5) gets into the database without an IDA diff.
+        /// </summary>
+        private void importAddressLibraryToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                if (Manager.CurrentDatabase == null)
+                {
+                    MessageBox.Show("A database needs to be loaded first!");
+                    return;
+                }
+
+                var of = new OpenFileDialog();
+                of.CheckFileExists = true;
+                of.Filter = "Address Library (version*.bin)|*.bin|All files|*.*";
+                of.Title = "Select a version-*.bin or versionlib-*.bin";
+
+                if (of.ShowDialog() != DialogResult.OK)
+                    return;
+
+                int format;
+                string moduleName;
+                int pointerSize;
+                var imported = Library.ReadAddressLibrary(new System.IO.FileInfo(of.FileName), out format, out moduleName, out pointerSize);
+
+                if (pointerSize != Manager.CurrentDatabase.PointerSize)
+                {
+                    MessageBox.Show("The file has pointer size " + pointerSize + " but the database has " + Manager.CurrentDatabase.PointerSize + "!", "Error", MessageBoxButtons.OK);
+                    return;
+                }
+
+                if (Manager.CurrentDatabase.TargetModuleName != null && !string.Equals(moduleName, Manager.CurrentDatabase.TargetModuleName, StringComparison.OrdinalIgnoreCase))
+                {
+                    if (MessageBox.Show("The file targets " + moduleName + " but the database targets " + Manager.CurrentDatabase.TargetModuleName + "! Continue anyway?", "Warning", MessageBoxButtons.YesNoCancel) != DialogResult.Yes)
+                        return;
+                }
+
+                var v = imported.Version;
+                if (Manager.CurrentDatabase.Versions == null)
+                    Manager.CurrentDatabase.Versions = new SortedDictionary<Version, Library>();
+
+                Library lib;
+                if (Manager.CurrentDatabase.Versions.TryGetValue(v, out lib))
+                {
+                    if (lib.Values != null && lib.Values.Count != 0)
+                    {
+                        if (MessageBox.Show("Version " + v + " already has " + lib.Values.Count + " offsets. Replace them with the " + imported.Values.Count + " offsets from the file? Hashes of IDs whose offset changes are discarded.", "Warning", MessageBoxButtons.YesNoCancel) != DialogResult.Yes)
+                            return;
+                    }
+                }
+                else
+                {
+                    lib = new Library();
+                    lib.Version = v;
+                    Manager.CurrentDatabase.Versions.Add(v, lib);
+                }
+
+                if (lib.Hashes != null && lib.Values != null)
+                {
+                    var stale = lib.Hashes.Keys.Where(id =>
+                    {
+                        uint o, n;
+                        return !(lib.Values.TryGetValue(id, out o) && imported.Values.TryGetValue(id, out n) && o == n);
+                    }).ToList();
+                    foreach (var id in stale)
+                        lib.Hashes.Remove(id);
+                }
+
+                lib.Values = imported.Values;
+
+                ulong high = imported.Values.Count != 0 ? imported.Values.Keys.Max() : 0;
+                if (high > Manager.CurrentDatabase.HighVID)
+                    Manager.CurrentDatabase.HighVID = high;
+
+                this.MarkModified(1);
+                this.UpdateLeftBox(v.ToString());
+
+                MessageBox.Show("Imported " + imported.Values.Count + " offsets (file format " + format + ") into version " + v + ". High ID is now " + Manager.CurrentDatabase.HighVID + ".");
+            }
+            catch (Exception ex)
+            {
+                ReportError(ex);
+            }
         }
 
         private void Form1_FormClosing(object sender, FormClosingEventArgs e)
@@ -1067,10 +1158,10 @@ namespace AddressLibraryManager
 
             try
             {
-                string fileName = "versionlib-" + string.Join("-", l.Version.Numbers) + ".bin";
+                string fileName = l.AddressLibraryFileName;
                 var fi = new System.IO.FileInfo(fileName);
                 l.WriteAddressLibrary(Manager.CurrentDatabase, fi);
-                MessageBox.Show("Wrote " + fileName + " to " + fi.DirectoryName + "!");
+                MessageBox.Show("Wrote " + fileName + " (format " + Library.AddressLibraryFormatFor(l.Version) + ") to " + fi.DirectoryName + "!");
             }
             catch(Exception ex)
             {
@@ -1099,7 +1190,7 @@ namespace AddressLibraryManager
                 string dirpath = null;
                 foreach (var pair in map)
                 {
-                    string fileName = "versionlib-" + string.Join("-", pair.Key.Numbers) + ".bin";
+                    string fileName = pair.Value.AddressLibraryFileName;
                     var fi = new System.IO.FileInfo(fileName);
                     pair.Value.WriteAddressLibrary(Manager.CurrentDatabase, fi);
                     did++;
