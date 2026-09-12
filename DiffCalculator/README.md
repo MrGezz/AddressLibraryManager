@@ -19,8 +19,8 @@ section — or `UNRESOLVED: <reason>`), `fndiff.log`.
 
 | File | What it does | Verified how |
 | --- | --- | --- |
-| `addrlib.py` | reads/writes format 1 (SE `version-*.bin`), 2 (AE packed, `WritePackedPair` from `Manager.cs`) and 5 (the dense table meh321 introduced with 1.7.99: 96-byte header, `uint32 offset[id]`, 0 = unassigned — the layout commonlib-shared's `REL::IDDB::load_v5` memory-maps); `format_for(version)` picks 1 / 2 / 5 the way meh321 ships them | `python addrlib.py <bin>` round-trips the shipped 1.5.97, 1.6.1170, 1.6.1179 and official 1.7.99 bins byte-identically |
-| `relib.py` | reads/writes the Manager's `.relib` database and `.rename` names | `python relib.py skyrimae.relib` round-trips byte-identically; its 1.6.1170 column equals the shipped bin (428,461 ids) |
+| `addrlib.py` | reads/writes format 1 (SE `version-*.bin`), 2 (AE packed, `WritePackedPair` from `Manager.cs`) and 5 (the dense table meh321 introduced with 1.7.99: 96-byte header, `uint32 offset[id]`, 0 = unassigned — the layout commonlib-shared's `REL::IDDB::load_v5` memory-maps); `format_for(version)` picks 1 / 2 / 5 the way meh321 ships them | `python addrlib.py <bin>` round-trips `versionlib-1-6-317-0.bin` (format 2, 415,815 ids) and `versionlib-1-7-104-0.bin` (format 5, 435,162 ids) byte-identically (2026-09-12) |
+| `relib.py` | reads/writes the Manager's `.relib` database and `.rename` names | `python relib.py skyrimae.relib` round-trips byte-identically; database now holds 14 versions, 1.6.317.0 through 1.7.104.0; all 13 pre-existing columns verified intact after adding the 1.7.104 column (2026-09-12) |
 | `pe.py` | PE32+ sections, `.pdata` functions (chained unwind fragments folded), DIR64 relocations, file version | function counts / section maps printed by `python pe.py <exe>` |
 | `fnhash.py` | per-function features: relocation-masked instruction hash (iced-x86), instruction IPs, outgoing calls, RIP-relative and absolute data references, opcode stream; leaf functions from `.pdata` gaps split at int3 padding, 16-aligned ret/jmp boundaries and known library addresses; pickled cache | ground truth below |
 | `fndiff.py` | the matcher (methods in the module docstring: hash → callgraph → locality → inner / ref / vtable / shift) and all writers | `--gt` |
@@ -80,6 +80,22 @@ before the next update. 11,436 IDs the derived bin placed are absent from the of
 library (meh321 dropped them), so agreement on the shared set is the only metric.
 
 The official bin is what ships now; the derived ones are kept for diagnosis only.
+
+## Official 1.7.104 bin (2026-09-12)
+
+meh321 published `versionlib-1-7-104-0.bin` (format 5, 565,759 slots, 435,162 assigned,
+130,597 zero/unassigned, HighVID 565,758). It was imported directly into
+`..\..\AddressLibraryDatabase\skyrimae.relib` using `relib.py`; no fndiff.py run was
+needed because the official bin covers the full ID space. The database now holds 14 versions,
+1.6.317.0 through 1.7.104.0, HighVID 565,758.
+
+C# code in `Manager.cs` (`ReadAddressLibrary` / `WriteDenseAddressLibrary`) was verified
+against the format-5 contract on 2026-09-12:
+- Header layout matches `addrlib.py`'s `V5_HEADER` exactly: format int32, version uint32[4],
+  name char[64], pointer\_size int32, data\_format int32 (reserved), count int32 (96 bytes total).
+- Zero/unassigned slots are skipped with an explicit `if (offset != 0)` guard in the reader
+  and rejected with an `InvalidOperationException` in the writer — no silent id→0 mapping.
+- `AddressLibraryFormatFor` returns `FormatDense` for any version ≥ 1.7, covering 1.7.104.
 
 ## Reading the result
 
