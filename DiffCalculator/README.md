@@ -26,6 +26,57 @@ section — or `UNRESOLVED: <reason>`), `fndiff.log`.
 | `fndiff.py` | the matcher (methods in the module docstring: hash → callgraph → locality → inner / ref / vtable / shift) and all writers | `--gt` |
 | `groundtruth.py` | `(old, new)` pairs from an SKSE "address update" commit (`RelocAddr`/`RelocPtr` literals) | 170 pairs for `ebc8000` (1.6.1170 → 1.7.99) in `data/` |
 | `stats.py` | feasibility numbers only | – |
+| `holescan.py` | which SKSE plugins carry CommonLib ids the runtime's library lacks (see below) | found `TES::GetWaterHeight` (13358) in the Surface Tides DLL that stopped the game on 1.7.104, and marks the `AE_CHECK` pairs as REPLACED (2026-09-29) |
+| `idfixscan.py` | which SKSE plugins carry a CommonLib id pair a newer CommonLib corrected (MOVED, SWAPPED, RETIRED, REMOVED, AE17, SINGLE; see below) | the 30 corrections between alandtse NG 9.1.0 and 10.1.0, read from the repository's own history, include `InventoryEntryData::SetWorn`'s swapped pair, which only the stored order tells apart (2026-10-02) |
+| `hooksite.py` | an Address Library id + in-function offset checked against a real executable: the instruction there, whether the offset is an instruction boundary; `calls` lists a function's call targets as ids, `dis` disassembles a range | the PapyrusTweaks site 53919+0x664 reads MID-INSTRUCTION on 1.7.104 (the crash of 2026-09-26) |
+| `hookscan.py` | finds `RELOCATION_ID` / `VariantID` / `REL::ID` + offset hook sites in plugin sources and checks each with hooksite | – |
+| `hookport.py` | carries a 1.6.x in-function offset to 1.7.x by finding the same normalised code window in the target's copy of the function: SAME, MOVED (new offset), NOMATCH | PapyrusTweaks' CompiledScriptLoader call: MOVED +0x664 -> +0x69C; the Improved Camera and Summon Actor Limit sites |
+| `steamstub.py` | decrypts a SteamStub 3.1 x64 executable's `.text` for static reading (the reference 1.6.x executables); never runs the stub, the output does not launch | – |
+
+## Missing ids in built plugins (`holescan.py`)
+
+A plugin resolves most CommonLib ids lazily, the first time a function runs, so an id the runtime's library lacks
+passes SKSE load and a main-menu smoke launch and stops the game later, in the world. `holescan.py` reads the
+`RELOCATION_ID(se, ae)` / `RelocationID` / `VariantID` pairs of the given CommonLib trees, keeps those whose AE id the
+library lacks, and reports each plugin DLL that holds both ids of such a pair within 64 bytes (the two ids of one
+`RELOCATION_ID` are compiled side by side). `RELOCATION_ID(se, AE_CHECK(runtime, old, new))` pairs whose `new` id is in
+the library and next to the old one in the DLL are REPLACED, not holes:
+
+```
+python holescan.py <versionlib bin> --mo2 <instance dir> <profile> --clib <CommonLib root> [...]
+python holescan.py <versionlib bin> --dll <dll> [...] --clib <CommonLib root> [...]
+```
+
+A HOLE means the function is linked, not that it is called: RelWithDebInfo links with `/OPT:NOREF` and keeps every
+function of a used CommonLib object. Read the plugin's sources for calls before fixing. On 1.7.104 (2026-09-29, 62
+DLLs, 7 CommonLib trees): `TES::GetWaterHeight` 13358 (Surface Tides calls it - fixed there; NGIO, Smooth Terrain,
+XPMF and Animated Bound Weapons only link it), `InventoryChanges::RemoveAllItems` 16118,
+`BSScaleformManager::IsValidName` 82331, `Renderer::RequestWindowResize` 77235 and `Script::CompileAndRun` 21890 -
+none called by the workspace's own plugins. A plugin that does call one needs the function's 1.7.x address carried
+from the executables (compare its body, callees and constants with the 1.6.x function) and a version-pinned patch.
+
+## Corrected ids in built plugins (`idfixscan.py`)
+
+A wrong AE id is worse than a missing one: the library has it, so the plugin resolves it silently and calls whatever
+function that id names. `idfixscan.py` reads the corrections from a CommonLib repository's history (the
+`RELOCATION_ID` / `REL::ID` lines a diff hunk removes, matched to the lines it adds) and reports each DLL that still
+carries an old pair:
+
+```
+python idfixscan.py <CommonLib repo> <old commit> <new commit> --mo2 <instance dir> <profile>
+python idfixscan.py <CommonLib repo> <old commit> <new commit> --dll <dll> [...]
+```
+
+On the Mosais build (2026-10-02, alandtse NG 9.1.0 `a898f4698` -> 10.1.0 `39f9d07a6`, 30 corrections): 66 DLLs, 57
+old pairs in 20 of them, mostly the `InventoryChanges` set (`GenerateLeveledListChanges` removed, `GetItemCount` and
+`SetUniqueID` moved, `SetWorn` swapped) and the three AE17 ids. Every plugin built in this workspace was read for
+calls: none calls a corrected function (the `SetUniqueID` calls are SKSE's serialization interface, which has no
+Address Library id; Underwater NG's `GetWaterHeight` is `TESObjectREFR`'s). The rest are third-party builds without
+source here (ConsoleUtilSSE NG, XPMF, Silent Dialogue Universal, Equip Enchantment Fix NG, NGIO, SKSE Menu Framework,
+Smooth Terrain, Open Animation Replacer, SPID, SSE Display Tweaks); SPID's and SSE Display Tweaks' published sources
+call none of them. As with holescan, a carried pair proves the function was linked; a release build linked with
+`/OPT:REF` usually drops unreferenced functions, so in a third-party DLL a carried pair is a reason to ask its author
+for a build against NG 10.x.
 
 Requires Python 3.12 and `pip install iced-x86`.
 
