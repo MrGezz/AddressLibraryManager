@@ -19,7 +19,16 @@ code does, not where it sits. Verdicts:
   REFMID   the offset is not an instruction boundary on the reference either: it was written
            for another 1.6.x build, or it is not a code offset
   NOID     the ID is not in one of the libraries
-Exit status 1 when anything other than SAME was printed.
+  PORTED   (scan) the source names a 1.7.x offset of its own and the 1.6 site is carried to exactly it
+  MISPORT  (scan) the source names a 1.7.x offset and the 1.6 site is carried somewhere else, or nowhere
+
+When no window matches - a recompiled function differs in a register or a member offset around the site - a
+site that is a direct call (or jmp out of the function) to a function with an ID is carried by call order: both
+builds of the function make equally many such calls to it, and the n-th there is the n-th here. With one call
+on each side that is SAME or MOVED outright (the line says "the only call"); with several it is SAME# / MOVED#
+and wants one look at the site (hooksite.py site). A trailing "~" is the relaxed window (the site instruction and
+the ones after it); a SAME~ whose site is also the only call to its function on both sides is SAME.
+Exit status 1 when anything other than SAME or PORTED was printed.
 """
 
 import argparse
@@ -54,14 +63,31 @@ class Side:
 
     def _pdata(self):
         ends = {}
+        self.unwind = {}
         for name, va, vsize, raw, rsize in self.img.sections:
             if name == ".pdata":
                 d = self.img.data[raw:raw + vsize]
                 for o in range(0, len(d) - 11, 12):
-                    b, e, _ = struct.unpack_from("<III", d, o)
+                    b, e, u = struct.unpack_from("<III", d, o)
                     if b:
                         ends[b] = e
+                        self.unwind[b] = u
         return ends
+
+    def whole(self, base):
+        """End of the function at base with every chunk the compiler split it into: the .pdata entry that starts
+        where the last one ended belongs to it when its unwind info is chained (UNW_FLAG_CHAININFO). None when the
+        function has no .pdata entry."""
+        end = self.pdata.get(base)
+        while end in self.pdata:
+            try:
+                chained = self.img.read(self.unwind[end], 1)[0] >> 3 & 4
+            except ValueError:
+                break
+            if not chained:
+                break
+            end = self.pdata[end]
+        return end
 
     def function(self, vid, need):
         base = self.res.rva(vid)
@@ -113,25 +139,69 @@ def port(ref, tgt, vid, off, before=WINDOW_BEFORE, after=WINDOW_AFTER):
     idx = idx[0]
     rend = ref.extent(rbase, rins)
     tend = tgt.extent(tbase, tins)
-    want, pos = window(ref, rins, idx, rbase, rend, before, after)
     tnorm = [tgt.norm(i, tbase, tend) for i in tins]
-    hits = []
-    for k in range(pos, len(tins) - (len(want) - pos) + 1):
-        if tnorm[k - pos:k - pos + len(want)] == want:
-            hits.append(tins[k].address - tbase)
     desc = "%s %s" % (rins[idx].mnemonic, rins[idx].op_str)
-    if off in hits:
-        return "SAME", off, desc
-    if len(hits) == 1:
-        return "MOVED", hits[0], desc
-    if hits:
-        return "AMBIG", min(hits, key=lambda h: abs(h - off)), desc
-    # relax: the site instruction and the ones after it only
-    if before:
-        v, n, d = port(ref, tgt, vid, off, 0, after)
-        if v in ("SAME", "MOVED", "AMBIG"):
-            return v + "~", n, d
+    # the full window first; then relaxed ("~"): the site instruction and the ones after it only
+    for lead, mark in ((before, ""), (0, "~")) if before else ((0, ""),):
+        want, pos = window(ref, rins, idx, rbase, rend, lead, after)
+        hits = []
+        for k in range(pos, len(tins) - (len(want) - pos) + 1):
+            if tnorm[k - pos:k - pos + len(want)] == want:
+                hits.append(tins[k].address - tbase)
+        if off in hits:
+            if mark:
+                # the relaxed window and the call order agree: two independent readings of one site
+                found = by_calls(ref, tgt, rins, tins, idx, rbase, tbase, rend, tend)
+                if found and found[0] == "SAME":
+                    return "SAME", off, "%s   [relaxed window; %s]" % (desc, found[2])
+            return "SAME" + mark, off, desc
+        if len(hits) == 1:
+            return "MOVED" + mark, hits[0], desc
+        if hits:
+            return "AMBIG" + mark, min(hits, key=lambda h: abs(h - off)), desc
+    found = by_calls(ref, tgt, rins, tins, idx, rbase, tbase, rend, tend)
+    if found:
+        return found[0], found[1], "%s   [%s]" % (desc, found[2])
     return "NOMATCH", None, desc
+
+
+def direct_target(ins):
+    if ins.id and ins.mnemonic in ("call", "jmp") and ins.op_count(x86.X86_OP_IMM):
+        return ins.operands[0].imm
+    return None
+
+
+def by_calls(ref, tgt, rins, tins, idx, rbase, tbase, rend, tend):
+    """(verdict, target offset, note) for a site that is a direct call - or a jmp out of the function - to a
+    function with an ID, when the target's copy of the function makes as many of them; None otherwise."""
+    site = rins[idx]
+    there = direct_target(site)
+    if there is None or (site.mnemonic == "jmp" and rbase <= there < rend):
+        return None
+    vid = ref.res.by_off.get(there)
+    if vid is None:
+        return None
+    try:
+        here = tgt.res.rva(vid)
+    except KeyError:
+        return None
+
+    def sites(side, base, insns, end, target):
+        whole = side.whole(base)
+        if whole:
+            insns = side.md.disasm(side.img.read(base, whole - base), base)
+            end = whole
+        return [i.address - base for i in insns if i.address < end and i.mnemonic == site.mnemonic and direct_target(i) == target]
+
+    rsites = sites(ref, rbase, rins, rend, there)
+    tsites = sites(tgt, tbase, tins, tend, here)
+    if len(rsites) != len(tsites) or site.address - rbase not in rsites:
+        return None
+    n = rsites.index(site.address - rbase)
+    same = tsites[n] == site.address - rbase
+    if len(rsites) == 1:
+        return ("SAME" if same else "MOVED"), tsites[n], "the only %s to ID %d on both" % (site.mnemonic, vid)
+    return ("SAME#" if same else "MOVED#"), tsites[n], "%s %d of %d to ID %d" % (site.mnemonic, n + 1, len(rsites), vid)
 
 
 VTABLE_HEADER = "D:/b/clib/ng-9.0.1/include/RE/Offsets_VTABLE.h"
@@ -294,12 +364,16 @@ def main(argv=None):
                 if not fn.lower().endswith(hookscan.EXTS):
                     continue
                 path = os.path.join(dirpath, fn)
-                for line, vid, off, st in hookscan.sites_in(path):
+                for line, vid, off, st, later in hookscan.sites_in(path):
                     if (vid, off) in seen:
                         continue
                     seen.add((vid, off))
                     v, n, d = port(ref, tgt, vid, off)
-                    if v != "SAME":
+                    if later is not None:
+                        carried = n == later and v.rstrip("~#") in ("SAME", "MOVED")
+                        d += "   (%s; the source's 1.7.x offset is %#x)" % (v, later)
+                        v = "PORTED" if carried else "MISPORT"
+                    if v not in ("SAME", "PORTED"):
                         bad += 1
                     elif not args.all:
                         continue
