@@ -93,6 +93,63 @@ def statements(text):
         yield start, "".join(buf)
 
 
+# A project's own offset macro: RELOCATION_OFFSET(se, ae) is REL::Relocate(se, ae). A third argument is the 1.7.99+
+# offset when the project defines RelocationOffset(se, ae_pre1799, ae_1799) with an IsAtLeast(RUNTIME_SSE_1_7_99)
+# pick (Precision's PCH.h); without such a definition it is the VR offset, as in REL::Relocate.
+ROFF = re.compile(r"\b(?:RELOCATION_OFFSET|RelocationOffset)\s*\(\s*" + num("se") + r"\s*,\s*" + num("ae")
+                  + r"(?:\s*,\s*" + num("third") + r")?\s*\)")
+ROFF_DEF = re.compile(r"RelocationOffset\s*\([^)]*,[^)]*,[^)]*\)[^{;]*\{[^}]*IsAtLeast\s*\(\s*(?:SKSE::)?RUNTIME_SSE_1_7_\d+",
+                      re.S)
+_roff_later = {}
+
+
+def roff_third_is_later(path):
+    """True when a header at or above the file's folder (four levels at most) defines the three-argument
+    RelocationOffset with a 1.7.99 pick."""
+    d = os.path.dirname(os.path.abspath(path))
+    chain = []
+    found = False
+    for _ in range(5):
+        if d in _roff_later:
+            found = _roff_later[d]
+            break
+        chain.append(d)
+        found = False
+        try:
+            for fn in os.listdir(d):
+                if fn.lower().endswith((".h", ".hpp")):
+                    try:
+                        if ROFF_DEF.search(open(os.path.join(d, fn), encoding="utf-8", errors="replace").read()):
+                            found = True
+                            break
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+        if found:
+            break
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    for c in chain:
+        _roff_later[c] = found
+    return found
+
+
+def expand_roff(text, later):
+    """Rewrite the project offset macro into the forms PICK and LATER read, keeping the line count."""
+    def sub(m):
+        keep = "\n" * m.group(0).count("\n")
+        a, b, c = m.group("se"), m.group("ae"), m.group("third")
+        if c is None:
+            return "REL::Relocate(%s, %s)%s" % (a, b, keep)
+        if later:
+            return "(REL::Module::IsAtLeast(SKSE::RUNTIME_SSE_1_7_99) ? %s : REL::Relocate(%s, %s))%s" % (c, a, b, keep)
+        return "REL::Relocate(%s, %s, %s)%s" % (a, b, c, keep)
+    return ROFF.sub(sub, text)
+
+
 def later_of(match):
     text = match.group("later")
     return int(text, 0) if text else None
@@ -105,6 +162,8 @@ def sites_in(path):
     except OSError:
         return
     text = re.sub(r"//[^\n]*", "", text)
+    if ROFF.search(text):
+        text = expand_roff(text, roff_third_is_later(path))
     declared = {}
     for line, st in statements(text):
         shown = " ".join(st.split())[:160]
