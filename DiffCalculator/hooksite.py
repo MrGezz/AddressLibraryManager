@@ -26,7 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import addrlib  # noqa: E402
 
 DEFAULT_EXE = "D:/SteamLibrary/steamapps/common/Skyrim Special Edition/SkyrimSE.exe"
-DEFAULT_LIB = "D:/Mosais/mods/Address Library for SKSE Plugins/SKSE/Plugins/versionlib-1-7-104-0.bin"
+DEFAULT_LIB = "F:/Mosais/mods/Address Library for SKSE Plugins/SKSE/Plugins/versionlib-1-7-104-0.bin"
 
 
 class Image:

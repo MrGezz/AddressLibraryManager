@@ -45,7 +45,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import hooksite  # noqa: E402
 import hookscan  # noqa: E402
 
-LIBDIR = "D:/Mosais/mods/Address Library for SKSE Plugins/SKSE/Plugins"
+LIBDIR = "F:/Mosais/mods/Address Library for SKSE Plugins/SKSE/Plugins"
 DEFAULT_REF_EXE = "D:/b/ref/SkyrimSE-1.6.318.unpacked.exe"
 DEFAULT_REF_LIB = LIBDIR + "/versionlib-1-6-318-0.bin"
 WINDOW_BEFORE = 2
