@@ -18,6 +18,19 @@ declaration may carry a base offset of its own - REL::Relocation target{ RELOCAT
 VAR_NUM(se, ae) in the literal's place - which is a site itself and is added to every later offset. An id followed
 by anything else is not followed: a guessed base would report a site that does not exist.
 
+A lone AE id is followed the same way, and so is a variable that holds a function's address:
+
+    REL::ID{ 36559 }.address() + 0x85E                        REL::ID(36559).address() + 0x1C4
+    const auto fn = REL::ID{ 41370 }.address();  ...  fn + 0x13E
+    auto setup = REL::RelocationID(100565, 107300).address();  ...  setup + 0x71
+
+and a file's own constants are written into their uses first ("constexpr auto kSetup = REL::ID(36559);" or
+"constexpr REL::ID kSetup{ 36559 };", and "constexpr std::ptrdiff_t kCall = 0x1C4;" make "kSetup.address() + kCall"
+a site). Offsets kept in a table of
+structs (an array of {id, offset}) are not followed. Every use of an address variable is reported, the ones in a
+runtime branch too: "if (IsAE()) setup + 0x71; else setup + 0x73" gives two rows, and the SE row, measured in the
+AE function, reads MID - read the branch before calling it a bug.
+
 An offset may be preceded by the one a later runtime needs:
 
     hook.address() + (REL::Module::IsAtLeast(SKSE::RUNTIME_SSE_1_7_99) ? 0x678 : REL::Relocate(0x4DC, 0x667))
@@ -65,6 +78,12 @@ PICK = r"(?:REL::)?(?:VariantOffset|Relocate|OFFSET_3|OFFSET)\s*\(\s*" + num("se
 ID2 = re.compile(r"(?:RELOCATION_ID|REL::RelocationID|RelocationID)\s*\(\s*" + NUM + r"\s*,\s*" + NUM + r"\s*\)")
 VID = re.compile(r"(?:REL::)?VariantID\s*\(\s*" + NUM + r"\s*,\s*" + NUM + r"\s*,\s*" + NUM + r"\s*\)")
 AEID = re.compile(r"REL::ID\s*\(\s*" + num("id") + r"\s*\)\s*,\s*" + LATER + num("off") + r"\s*[}\)]")
+# A lone AE id, REL::ID(n) or REL::ID{ n }: a site when ".address() + off" follows it, or through the variable its
+# statement declares. "REL::ID(n), off" inside a Relocation's braces is AEID's and is left to it.
+SID = re.compile(r"REL::ID\s*[\(\{]\s*" + NUM + r"\s*[\)\}](?!\s*,)")
+# "auto fn = <id>.address();" names the function's address; "fn + 0x13E" in a later statement is then a site.
+ADDR_DECL = re.compile(r"\s*\.\s*address\s*\(\s*\)\s*;")
+ADDR_USED = re.compile(r"\b(?P<name>[A-Za-z_]\w*)\s*\+\s*" + LATER + num("lit") + r"\b")
 OFF = re.compile(LATER + PICK)
 # the variable a statement declares from an id, and that variable's address with an offset added
 DECLARED = re.compile(r"([A-Za-z_]\w*)\s*[\{\(=]\s*$")
@@ -150,6 +169,32 @@ def expand_roff(text, later):
     return ROFF.sub(sub, text)
 
 
+# A file's own constants: "constexpr std::ptrdiff_t kUpdateCall = 0x1C4;", "constexpr auto kSetup = REL::ID(36559);"
+# and the typed form "constexpr REL::ID kSetup{ 36559 };" (an integer constant is never one whose type names REL::,
+# or the typed form would read as the bare number and its ".address() + offset" would be lost).
+INT_CONST = re.compile(r"\bconstexpr\b(?![^;=(){}\n]*REL::)[^;=(){}\n]*?\b([A-Za-z_]\w*)\s*(?:=\s*|\{\s*)(0x[0-9A-Fa-f]+|\d+)\s*[uUlL]*\s*\}?\s*;")
+ID_CONST = re.compile(r"\bconstexpr\b[^;=(){}\n]*?\b([A-Za-z_]\w*)\s*(?:=\s*|\{\s*)(REL::ID\s*[\(\{]\s*(?:0x[0-9A-Fa-f]+|\d+)\s*[\)\}])\s*\}?\s*;")
+TYPED_ID_CONST = re.compile(r"\bconstexpr\b[^;=(){}\n]*?\bREL::ID\s+([A-Za-z_]\w*)\s*(?:=\s*|\{\s*|\(\s*)(0x[0-9A-Fa-f]+|\d+)\s*[\)\}]?\s*;")
+
+
+def inline_constants(text):
+    """Write a file's own constexpr integers and REL::ID constants into their uses, so "kSetup.address() + kCall"
+    reads as "REL::ID(36559).address() + 0x1C4". A name defined twice with different values is left alone; the
+    declarations themselves are kept, and so is the line count."""
+    values = {}
+    for pattern in (INT_CONST, ID_CONST):
+        for m in pattern.finditer(text):
+            values.setdefault(m.group(1), set()).add(" ".join(m.group(2).split()))
+    for m in TYPED_ID_CONST.finditer(text):
+        values.setdefault(m.group(1), set()).add("REL::ID(%s)" % m.group(2))
+    values = {k: v.pop() for k, v in values.items() if len(v) == 1}
+    if not values:
+        return text
+    decl = {m.start(1) for p in (INT_CONST, ID_CONST, TYPED_ID_CONST) for m in p.finditer(text)}
+    use = re.compile(r"(?<![\w.:>])(" + "|".join(re.escape(k) for k in sorted(values, key=len, reverse=True)) + r")\b")
+    return use.sub(lambda m: m.group(0) if m.start() in decl else values[m.group(1)], text)
+
+
 def later_of(match):
     text = match.group("later")
     return int(text, 0) if text else None
@@ -164,11 +209,24 @@ def sites_in(path):
     text = re.sub(r"//[^\n]*", "", text)
     if ROFF.search(text):
         text = expand_roff(text, roff_third_is_later(path))
+    text = inline_constants(text)
     declared = {}
+    addresses = {}  # variable -> AE id, for "auto fn = REL::ID{ n }.address();"
     for line, st in statements(text):
         shown = " ".join(st.split())[:160]
         ids = [(int(m.group(2), 0), m) for m in ID2.finditer(st)] + [(int(m.group(2), 0), m) for m in VID.finditer(st)]
+        ids += [(int(m.group(1), 0), m) for m in SID.finditer(st)]
         offs = list(OFF.finditer(st))
+        for use in ADDR_USED.finditer(st):
+            ae = addresses.get(use.group("name"))
+            if ae is not None and not st[use.end():].lstrip().startswith(("*", "/")):
+                off = int(use.group("lit"), 0)
+                if off:
+                    yield line, ae, off, shown, later_of(use)
+        for ae, m in ids:
+            name = DECLARED.search(st[:m.start()])
+            if name and ADDR_DECL.match(st, m.end()):
+                addresses[name.group(1)] = ae
         for use in USED.finditer(st):
             known = declared.get(use.group("name"))
             if known is None:

@@ -20,7 +20,14 @@ site lands wherever the instruction moved to in this runtime, so each one needs 
 (hooksite.py / hookport.py) before the plugin is trusted. The count in the summary line is hookscan.py's, which also
 follows an id into the variable it initialises (the offset is then added in a later statement). REL::Offset / REL::VariantOffset carry addresses of one
 executable and are listed as RAW: they hold for no other runtime. Exit code 1 when an id is missing or unresolved.
+
+So do offsets added to the image base itself, REL::Module::get().base() + 0x12466BC (a constant may stand for the
+number): each is listed as IMAGE with the id the address falls in on the library's runtime ("93210+0x1BC"), which is
+what hooksite.py / hookport.py take, and a name that is not a constant of the sources as IMAGE ?. A variable that
+takes the bare image base ("auto base = REL::Module::get().base();") is listed as BASE: the offsets added to it
+elsewhere are not followed, so read them by hand. IMAGE and BASE rows hold for one executable and never fail the run.
 """
+import bisect
 import os
 import re
 import sys
@@ -34,6 +41,9 @@ PAIR = re.compile(r"(RELOCATION_ID|REL::RelocationID|RelocationID|REL::VariantID
                   r"\s*,\s*" + ARG)
 SINGLE = re.compile(r"REL::ID\s*[\(\{]\s*" + ARG + r"\s*[\)\}]")
 RAW = re.compile(r"(REL::VariantOffset|REL::Offset)\s*[\(\{]\s*(0x[0-9A-Fa-f]+|\d+)(?:\s*,\s*(0x[0-9A-Fa-f]+|\d+))?")
+IMAGE_BASE = r"(?:REL::)?Module::get\s*\(\s*\)\s*\.\s*base\s*\(\s*\)"
+IMAGE = re.compile(IMAGE_BASE + r"\s*\+\s*(0x[0-9A-Fa-f]+|[A-Za-z_][\w:]*|\d+)")
+BASE_VAR = re.compile(r"\b([A-Za-z_]\w*)\s*(?:=|\{)\s*" + IMAGE_BASE + r"\s*\}?\s*;")
 OFFSET = re.compile(r"REL::Relocate\s*\(\s*(0x[0-9A-Fa-f]+|\d+)\s*,\s*(0x[0-9A-Fa-f]+|\d+)|\+\s*(0x[0-9A-Fa-f]+)")
 CONSTANT = re.compile(r"\b(?:constexpr|const)\b[^;=(){}\n]*?\b([A-Za-z_]\w*)\s*(?:=\s*|\{\s*|\(\s*)"
                       r"(0x[0-9A-Fa-f]+|\d+)\s*(?:[uU]?[lL]{0,2})\s*[\}\)]?\s*;")
@@ -150,7 +160,34 @@ def scan(root, lib):
         for m in RAW.finditer(text):
             line = text.count("\n", 0, m.start()) + 1
             rows.append((rel, line, "RAW", -1, int(m.group(3) or m.group(2), 0), m.group(1), ""))
+        for m in IMAGE.finditer(text):
+            line = text.count("\n", 0, m.start()) + 1
+            arg = m.group(1)
+            value = int(arg, 0) if arg[0].isdigit() else table.get(arg.rsplit("::", 1)[-1])
+            rows.append((rel, line, "IMAGE", -1, value, containing_id(lib, value), "" if arg[0].isdigit() else arg))
+        for m in BASE_VAR.finditer(text):
+            line = text.count("\n", 0, m.start()) + 1
+            rows.append((rel, line, "BASE", -1, None, m.group(1), ""))
     return rows
+
+
+_by_offset = {}
+
+
+def containing_id(lib, rva):
+    """'<id>+0x<delta>': the id at or below an image offset in the library (a function's start when the address
+    is code), or '' when there is none."""
+    if rva is None:
+        return ""
+    key = id(lib)
+    if key not in _by_offset:
+        _by_offset[key] = sorted((off, vid) for vid, off in lib.values.items())
+    table = _by_offset[key]
+    i = bisect.bisect_right(table, (rva, float("inf"))) - 1
+    if i < 0:
+        return ""
+    off, vid = table[i]
+    return "%d+%#x" % (vid, rva - off)
 
 
 def site_count(root):
@@ -169,20 +206,30 @@ def main():
     failures = 0
     for root in args[1:]:
         rows = scan(root, lib)
-        ids = [r for r in rows if r[2] != "RAW"]
+        ids = [r for r in rows if r[2] not in ("RAW", "IMAGE", "BASE")]
         named = sorted({r[3] for r in ids if r[3] is not None})
         lacking = sorted({r[3] for r in ids if r[3] is not None and not r[4]})
         unresolved = sorted({r[6] for r in ids if r[3] is None})
         sites = site_count(root)
         raw = [r for r in rows if r[2] == "RAW"]
+        image = [r for r in rows if r[2] == "IMAGE"]
+        bases = [r for r in rows if r[2] == "BASE"]
         print("%s: %d id(s) named, %d missing from %s, %d unresolved name(s), %d with an in-function offset, "
-              "%d raw offset(s)" % (root, len(named), len(lacking), lib.version_string, len(unresolved), sites,
-                                    len(raw)))
+              "%d raw offset(s), %d image offset(s), %d image base variable(s)"
+              % (root, len(named), len(lacking), lib.version_string, len(unresolved), sites, len(raw), len(image),
+                 len(bases)))
         for r in rows:
             where = "%s:%d" % (r[0], r[1])
             label = " = %s" % r[6] if r[6] else ""
             if r[2] == "RAW":
                 print("   RAW       %#9x  %s (%s)" % (r[4], where, r[5]))
+            elif r[2] == "IMAGE":
+                if r[4] is None:
+                    print("   IMAGE ?   %s  %s (not a constant of these sources: read by hand)" % (r[6], where))
+                else:
+                    print("   IMAGE     %#9x  %s %s%s" % (r[4], where, r[5], label))
+            elif r[2] == "BASE":
+                print("   BASE      %s  %s (image base kept in a variable: its offsets are not followed)" % (r[5], where))
             elif r[3] is None:
                 print("   UNRESOLVED %s  %s (%s)" % (r[6], where, r[2]))
             elif not r[4]:
